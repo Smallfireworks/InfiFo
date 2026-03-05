@@ -2,6 +2,10 @@
 
 ## Frontend Features (Current)
 
+![alt text](example.png)
+
+![alt text](example2.png)
+
 - Owner / Visitor mode switch in sidebar.
 - `Visitor` mode is read-only in UI (no add/edit/delete/drag/run/connect actions).
 - `Owner` mode can edit canvas, organize blocks, lock/unlock grouped blocks, and create links.
