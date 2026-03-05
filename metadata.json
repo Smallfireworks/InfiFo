@@ -1,0 +1,5 @@
+{
+  "name": "Paper Notebook Blog",
+  "description": "A minimalist, paper-style personal blog with Jupyter-like code execution and AI assistance.",
+  "requestFramePermissions": []
+}
