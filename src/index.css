@@ -118,3 +118,42 @@ body {
 .markdown-body ul { list-style-type: disc; padding-left: 1.5em; margin-bottom: 1em; }
 .markdown-body ol { list-style-type: decimal; padding-left: 1.5em; margin-bottom: 1em; }
 .markdown-body blockquote { border-left: 4px solid var(--color-accent); padding-left: 1em; color: var(--color-ink-light); font-style: italic; }
+
+.code-highlight {
+  font-family: var(--font-mono);
+  line-height: 1.45;
+}
+
+.code-token-plain {
+  color: var(--color-ink);
+}
+
+.code-token-keyword {
+  color: #0b3c6d;
+  font-weight: 600;
+}
+
+.code-token-builtin {
+  color: #8a4b08;
+}
+
+.code-token-type {
+  color: #0a6b6d;
+}
+
+.code-token-string {
+  color: #0b7a3e;
+}
+
+.code-token-number {
+  color: #8b0000;
+}
+
+.code-token-comment {
+  color: rgba(44, 44, 44, 0.58);
+  font-style: italic;
+}
+
+.code-token-operator {
+  color: #334155;
+}

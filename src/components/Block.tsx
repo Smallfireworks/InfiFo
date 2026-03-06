@@ -1,6 +1,17 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { BlockData } from '../types';
+import {
+  CODE_LANGUAGE_OPTIONS,
+  canExecuteInBrowser,
+  getCodeBackendHint,
+  getCodeLanguageLabel,
+  getCodePlaceholder,
+  highlightCode,
+  normalizeCodeLanguage,
+  type CodeTokenType,
+  type SupportedCodeLanguage
+} from '../services/codeLanguage';
 import Markdown from 'react-markdown';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
@@ -46,6 +57,12 @@ interface BlockProps {
   isBreakpointHit?: boolean;
   isAnyCodeExecuting?: boolean;
   onFocusBlock?: () => void;
+  previewOffset?: { x: number; y: number } | null;
+  onDragPreview?: (position: { x: number; y: number }) => void;
+  onDragPreviewEnd?: () => void;
+  codeLanguage?: SupportedCodeLanguage;
+  onCodeLanguageChange?: (language: SupportedCodeLanguage) => void;
+  linkedCodeStats?: { total: number; sameLanguage: number; mixedLanguage: number };
 }
 
 type DrawTool = 'pen' | 'eraser';
@@ -60,6 +77,16 @@ type GraphCommand =
   | { type: 'polygon'; points: Array<{ x: number; y: number }> };
 
 const GRAPH_COLORS = ['#1f4f9d', '#8b0000', '#0b7a3e', '#8b5a00', '#5d2f86', '#3b4f5c'];
+const CODE_TOKEN_CLASS: Record<CodeTokenType, string> = {
+  plain: 'code-token-plain',
+  keyword: 'code-token-keyword',
+  builtin: 'code-token-builtin',
+  type: 'code-token-type',
+  string: 'code-token-string',
+  number: 'code-token-number',
+  comment: 'code-token-comment',
+  operator: 'code-token-operator'
+};
 
 function getDefaultBlockSize(block: BlockData) {
   if (block.size) return block.size;
@@ -260,13 +287,20 @@ export function Block({
   hasBreakpoint = false,
   isBreakpointHit = false,
   isAnyCodeExecuting = false,
-  onFocusBlock
+  onFocusBlock,
+  previewOffset = null,
+  onDragPreview,
+  onDragPreviewEnd,
+  codeLanguage,
+  onCodeLanguageChange,
+  linkedCodeStats
 }: BlockProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [selectionRect, setSelectionRect] = useState<DOMRect | null>(null);
   const [selectedText, setSelectedText] = useState('');
   const [mediaError, setMediaError] = useState(false);
   const [isSketching, setIsSketching] = useState(false);
+  const [isDraggingSelf, setIsDraggingSelf] = useState(false);
   const [resizePreview, setResizePreview] = useState<{ width: number; height: number } | null>(null);
   const [hoverResizeDir, setHoverResizeDir] = useState<ResizeDirection | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -303,6 +337,17 @@ export function Block({
   const drawSize = typeof blockMeta.drawSize === 'number' ? Math.min(32, Math.max(1, blockMeta.drawSize)) : 2;
   const drawTool: DrawTool = blockMeta.drawTool === 'eraser' ? 'eraser' : 'pen';
   const graphMode: GraphMode = blockMeta.graphMode === 'geometry' ? 'geometry' : 'function';
+  const resolvedCodeLanguage = useMemo(
+    () => (block.type === 'code' ? (codeLanguage ?? normalizeCodeLanguage(blockMeta.language)) : 'javascript'),
+    [block.type, blockMeta.language, codeLanguage]
+  );
+  const codeLanguageLabel = useMemo(() => getCodeLanguageLabel(resolvedCodeLanguage), [resolvedCodeLanguage]);
+  const codePlaceholder = useMemo(() => getCodePlaceholder(resolvedCodeLanguage), [resolvedCodeLanguage]);
+  const codeCanRunInBrowser = useMemo(() => canExecuteInBrowser(resolvedCodeLanguage), [resolvedCodeLanguage]);
+  const highlightedCode = useMemo(
+    () => (block.type === 'code' ? highlightCode(block.content, resolvedCodeLanguage) : []),
+    [block.content, block.type, resolvedCodeLanguage]
+  );
   const graphViewport = useMemo(() => normalizeGraphViewport(blockMeta), [blockMeta]);
   const graphCommands = useMemo(() => parseGraphCommands(block.content), [block.content]);
   const graphFunctionLines = useMemo(
@@ -324,11 +369,15 @@ export function Block({
   const drawCanvasHeight = useMemo(() => Math.max(160, activeSize.height - 96), [activeSize.height]);
   const graphCanvasWidth = useMemo(() => Math.max(300, activeSize.width - 24), [activeSize.width]);
   const graphCanvasHeight = useMemo(() => Math.max(190, activeSize.height - 148), [activeSize.height]);
+  const previewDx = previewOffset?.x ?? 0;
+  const previewDy = previewOffset?.y ?? 0;
+  const showOwnerCodePreview = block.type === 'code' && isOwner && activeSize.height >= 300;
 
   useEffect(() => {
-    x.set(block.position.x);
-    y.set(block.position.y);
-  }, [block.position.x, block.position.y, x, y]);
+    if (resizeSessionRef.current || isDraggingSelf) return;
+    x.set(block.position.x + previewDx);
+    y.set(block.position.y + previewDy);
+  }, [block.position.x, block.position.y, previewDx, previewDy, x, y, isDraggingSelf]);
 
   useEffect(() => {
     if (!isOwner) {
@@ -595,6 +644,10 @@ export function Block({
       onRunCode();
       return;
     }
+    if (!codeCanRunInBrowser) {
+      onChange({ output: getCodeBackendHint(resolvedCodeLanguage), error: undefined });
+      return;
+    }
     const originalLog = console.log;
     try {
       const logs: string[] = [];
@@ -616,6 +669,22 @@ export function Block({
     } finally {
       console.log = originalLog;
     }
+  };
+
+  const renderHighlightedCode = (emptyText: string) => {
+    if (!block.content) {
+      return <span className="code-token-comment">{emptyText}</span>;
+    }
+    return highlightedCode.map((line, lineIndex) => (
+      <React.Fragment key={`line-${lineIndex}`}>
+        {line.tokens.map((token, tokenIndex) => (
+          <span key={`token-${lineIndex}-${tokenIndex}`} className={CODE_TOKEN_CLASS[token.type]}>
+            {token.text}
+          </span>
+        ))}
+        {lineIndex < highlightedCode.length - 1 ? '\n' : null}
+      </React.Fragment>
+    ));
   };
 
   const handleSelection = () => {
@@ -905,20 +974,32 @@ export function Block({
       dragControls={dragControls}
       dragListener={false}
       dragMomentum={false}
+      onDragStart={() => {
+        if (!canDrag) return;
+        setIsDraggingSelf(true);
+        onFocusBlock?.();
+      }}
       onDrag={() => {
-        if (!canDrag || !onResolveDragPosition) return;
-        const resolved = onResolveDragPosition({ x: x.get(), y: y.get() }, 'move');
-        if (resolved.x !== x.get()) x.set(resolved.x);
-        if (resolved.y !== y.get()) y.set(resolved.y);
+        if (!canDrag) return;
+        const currentPosition = { x: x.get() - previewDx, y: y.get() - previewDy };
+        const resolved = onResolveDragPosition
+          ? onResolveDragPosition(currentPosition, 'move')
+          : currentPosition;
+        if (resolved.x + previewDx !== x.get()) x.set(resolved.x + previewDx);
+        if (resolved.y + previewDy !== y.get()) y.set(resolved.y + previewDy);
+        onDragPreview?.(resolved);
       }}
       onDragEnd={() => {
         if (!canDrag) return;
+        const currentPosition = { x: x.get() - previewDx, y: y.get() - previewDy };
         const resolved = onResolveDragPosition
-          ? onResolveDragPosition({ x: x.get(), y: y.get() }, 'end')
-          : { x: x.get(), y: y.get() };
-        x.set(resolved.x);
-        y.set(resolved.y);
+          ? onResolveDragPosition(currentPosition, 'end')
+          : currentPosition;
+        x.set(resolved.x + previewDx);
+        y.set(resolved.y + previewDy);
         onChange({ position: resolved });
+        onDragPreviewEnd?.();
+        setIsDraggingSelf(false);
       }}
       style={{
         position: 'absolute',
@@ -1076,11 +1157,47 @@ export function Block({
       {block.type === 'code' && (
         <div className={codeShellClass}>
           <div className={`flex items-center justify-between px-4 py-2 ${showBlockFrames ? 'border-b border-[var(--color-ink)]/5' : ''}`}>
-            <div className="flex items-center gap-2">
-              <span className="text-[10px] font-mono font-bold text-[var(--color-ink-light)] uppercase tracking-wider">JS</span>
-              {linkedCode.length > 0 && (
+            <div className="flex items-center gap-2 flex-wrap">
+              {isOwner ? (
+                <select
+                  value={resolvedCodeLanguage}
+                  onChange={(e) => {
+                    const nextLanguage = normalizeCodeLanguage(e.target.value);
+                    if (onCodeLanguageChange) {
+                      onCodeLanguageChange(nextLanguage);
+                    } else {
+                      onChange({
+                        meta: {
+                          ...(block.meta || {}),
+                          language: nextLanguage
+                        }
+                      });
+                    }
+                  }}
+                  className="text-[10px] font-mono font-bold uppercase tracking-wider text-[var(--color-ink-light)] border border-[var(--color-ink)]/15 rounded px-1.5 py-0.5 bg-[var(--color-paper)]"
+                >
+                  {CODE_LANGUAGE_OPTIONS.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <span className="text-[10px] font-mono font-bold text-[var(--color-ink-light)] uppercase tracking-wider">{codeLanguageLabel}</span>
+              )}
+              {linkedCodeStats && linkedCodeStats.sameLanguage > 0 && (
                 <span className="text-[10px] font-mono text-[var(--color-accent-blue)] bg-[var(--color-accent-blue)]/10 px-1.5 py-0.5 rounded">
-                  {linkedCode.length} linked file(s)
+                  {linkedCodeStats.sameLanguage} linked file(s)
+                </span>
+              )}
+              {linkedCodeStats && linkedCodeStats.mixedLanguage > 0 && (
+                <span className="text-[10px] font-mono text-[var(--color-accent)] bg-[var(--color-accent)]/10 px-1.5 py-0.5 rounded">
+                  {linkedCodeStats.mixedLanguage} cross-language
+                </span>
+              )}
+              {!codeCanRunInBrowser && (
+                <span className="text-[10px] font-mono text-[var(--color-ink-light)] bg-[var(--color-ink)]/10 px-1.5 py-0.5 rounded">
+                  Backend Runtime
                 </span>
               )}
               {hasBreakpoint && (
@@ -1111,6 +1228,7 @@ export function Block({
                   onClick={executeCode}
                   disabled={isCodeRunning || isAnyCodeExecuting}
                   className="flex items-center gap-1 text-xs font-medium px-2 py-1 bg-[var(--color-ink)]/10 text-[var(--color-ink)] rounded hover:bg-[var(--color-ink)]/20 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                  title={codeCanRunInBrowser ? 'Run current code chain' : 'Step through chain (real execution requires backend runtime)'}
                 >
                   <Play size={12} /> Run
                 </button>
@@ -1118,16 +1236,30 @@ export function Block({
             </div>
           </div>
           {isOwner ? (
-            <textarea
-              ref={textareaRef}
-              value={block.content}
-              onChange={handleContentChange}
-              className="w-full flex-1 min-h-0 overflow-auto hover-scroll bg-transparent border-none outline-none resize-none font-mono text-sm text-[var(--color-ink)] p-4"
-              placeholder="// Write JavaScript code here..."
-              spellCheck={false}
-            />
+            <div className="flex flex-1 min-h-0 flex-col">
+              <textarea
+                ref={textareaRef}
+                value={block.content}
+                onChange={handleContentChange}
+                className={`w-full ${showOwnerCodePreview ? 'min-h-[96px]' : 'flex-1 min-h-0'} overflow-auto hover-scroll bg-transparent border-none outline-none resize-none font-mono text-sm text-[var(--color-ink)] p-4`}
+                placeholder={codePlaceholder}
+                spellCheck={false}
+              />
+              {showOwnerCodePreview && (
+                <div className={`bg-[var(--color-ink)]/[0.03] ${showBlockFrames ? 'border-t border-[var(--color-ink)]/8' : ''}`}>
+                  <div className="px-4 pt-2 text-[10px] font-mono uppercase tracking-wider text-[var(--color-ink-light)]/80">
+                    Syntax Preview
+                  </div>
+                  <pre className="px-4 pb-3 pt-1 text-sm font-mono text-[var(--color-ink)] whitespace-pre-wrap overflow-auto hover-scroll max-h-40 code-highlight">
+                    {renderHighlightedCode(codePlaceholder)}
+                  </pre>
+                </div>
+              )}
+            </div>
           ) : (
-            <pre className="p-4 text-sm font-mono text-[var(--color-ink)] whitespace-pre-wrap overflow-auto hover-scroll">{block.content || '// Empty code block'}</pre>
+            <pre className="p-4 text-sm font-mono text-[var(--color-ink)] whitespace-pre-wrap overflow-auto hover-scroll code-highlight">
+              {renderHighlightedCode(codePlaceholder)}
+            </pre>
           )}
           
           {(block.output || block.error) && (

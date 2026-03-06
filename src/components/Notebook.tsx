@@ -2,6 +2,12 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { BlockData, BlockType, LayoutSettings, Note } from '../types';
 import { Block } from './Block';
 import { Type, Code as CodeIcon, Square, Image as ImageIcon, Music, PenTool, LineChart, type LucideIcon } from 'lucide-react';
+import {
+  canExecuteInBrowser,
+  getCodeBackendHint,
+  getCodeLanguageLabel,
+  normalizeCodeLanguage
+} from '../services/codeLanguage';
 
 interface NotebookProps {
   note: Note;
@@ -159,6 +165,7 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
   const [isPanning, setIsPanning] = useState(false);
   const [dragGuides, setDragGuides] = useState<GuideState>({ x: null, y: null });
   const [connectingFromId, setConnectingFromId] = useState<string | null>(null);
+  const [groupDragPreview, setGroupDragPreview] = useState<{ groupId: string; dx: number; dy: number } | null>(null);
   const [runningCodeChain, setRunningCodeChain] = useState<string[]>([]);
   const [activeRunningCodeId, setActiveRunningCodeId] = useState<string | null>(null);
   const [breakpointHitId, setBreakpointHitId] = useState<string | null>(null);
@@ -252,6 +259,7 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
       setContextMenu(null);
       setConnectingFromId(null);
       setDragGuides({ x: null, y: null });
+      setGroupDragPreview(null);
       setRunningCodeChain([]);
       setActiveRunningCodeId(null);
       setBreakpointHitId(null);
@@ -259,6 +267,7 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
   }, [isOwner]);
 
   useEffect(() => {
+    setGroupDragPreview(null);
     setRunningCodeChain([]);
     setActiveRunningCodeId(null);
     setBreakpointHitId(null);
@@ -282,6 +291,43 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
     ), 0);
     return maxLayer + 1;
   }, []);
+
+  const blockMap = useMemo(
+    () => new Map(note.blocks.map((item) => [item.id, item])),
+    [note.blocks]
+  );
+
+  const handleGroupDragPreview = useCallback((groupId: string, nextPosition: { x: number; y: number }) => {
+    const group = blockMap.get(groupId);
+    if (!group || group.type !== 'group') return;
+    const dx = nextPosition.x - group.position.x;
+    const dy = nextPosition.y - group.position.y;
+    setGroupDragPreview((prev) => {
+      if (!prev && dx === 0 && dy === 0) return prev;
+      if (prev && prev.groupId === groupId && prev.dx === dx && prev.dy === dy) return prev;
+      return { groupId, dx, dy };
+    });
+  }, [blockMap]);
+
+  const clearGroupDragPreview = useCallback((groupId: string) => {
+    setGroupDragPreview((prev) => (prev?.groupId === groupId ? null : prev));
+  }, []);
+
+  const getBlockPreviewOffset = useCallback((block: BlockData) => {
+    if (!groupDragPreview) return null;
+    if (block.id === groupDragPreview.groupId) return null;
+    if (!isDescendantOf(block, groupDragPreview.groupId, blockMap)) return null;
+    return { x: groupDragPreview.dx, y: groupDragPreview.dy };
+  }, [blockMap, groupDragPreview]);
+
+  const getRenderedPosition = useCallback((block: BlockData) => {
+    const offset = getBlockPreviewOffset(block);
+    if (!offset) return block.position;
+    return {
+      x: block.position.x + offset.x,
+      y: block.position.y + offset.y
+    };
+  }, [getBlockPreviewOffset]);
 
   const isCanvasBackgroundTarget = (target: HTMLElement | null) => {
     if (!target) return false;
@@ -432,7 +478,7 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
       const dy = updates.position.y - block.position.y;
       const blockMap = new Map(newBlocks.map((item) => [item.id, item]));
       newBlocks = newBlocks.map((item) => {
-        if (item.id !== id && isDescendantOf(item, id, blockMap) && item.locked) {
+        if (item.id !== id && isDescendantOf(item, id, blockMap)) {
           return { ...item, position: { x: item.position.x + dx, y: item.position.y + dy } };
         }
         return item;
@@ -579,7 +625,7 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
     const paddingTop = 80;
     const blockMap = new Map(note.blocks.map((item) => [item.id, item]));
 
-    const children = note.blocks
+    const candidates = note.blocks
       .filter((item) => {
         if (item.id === groupId) return false;
         if (isAncestorOf(item.id, groupId, blockMap)) return false;
@@ -587,6 +633,17 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
         const centerX = item.position.x + width / 2;
         const centerY = item.position.y + height / 2;
         return centerX >= groupX && centerX <= groupX + groupW && centerY >= groupY && centerY <= groupY + groupH;
+      });
+    const candidateIds = new Set(candidates.map((item) => item.id));
+    const children = candidates
+      .filter((item) => {
+        let parentId = item.parentId;
+        while (parentId) {
+          if (parentId === groupId) return true;
+          if (candidateIds.has(parentId)) return false;
+          parentId = blockMap.get(parentId)?.parentId;
+        }
+        return true;
       })
       .sort((a, b) => (a.position.y - b.position.y) || (a.position.x - b.position.x));
 
@@ -677,6 +734,17 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
     const requiredWidth = Math.max(groupW, maxRight - groupX + paddingX);
     const requiredHeight = Math.max(groupH, maxBottom - groupY + gap + 24);
 
+    const groupShift = new Map<string, { dx: number; dy: number }>();
+    for (const child of measuredChildren) {
+      if (child.item.type !== 'group') continue;
+      const nextPos = updates.get(child.item.id);
+      if (!nextPos) continue;
+      groupShift.set(child.item.id, {
+        dx: nextPos.x - child.item.position.x,
+        dy: nextPos.y - child.item.position.y
+      });
+    }
+
     const newBlocks = note.blocks.map((item) => {
       if (item.id === groupId) {
         return {
@@ -690,12 +758,33 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
       const position = updates.get(item.id);
       if (position) {
         const nextSize = sizeUpdates.get(item.id);
+        const isNestedGroup = item.type === 'group';
         return {
           ...item,
           position,
           size: nextSize ? { ...item.size, ...nextSize } : item.size,
           parentId: groupId,
-          locked: true
+          locked: isNestedGroup ? false : true
+        };
+      }
+      let shiftX = 0;
+      let shiftY = 0;
+      let cursor = item.parentId;
+      while (cursor) {
+        const shift = groupShift.get(cursor);
+        if (shift) {
+          shiftX += shift.dx;
+          shiftY += shift.dy;
+        }
+        cursor = blockMap.get(cursor)?.parentId;
+      }
+      if (shiftX !== 0 || shiftY !== 0) {
+        return {
+          ...item,
+          position: {
+            x: item.position.x + shiftX,
+            y: item.position.y + shiftY
+          }
         };
       }
       return item;
@@ -745,12 +834,14 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
     const incoming = new Map<string, string[]>();
     const undirected = new Map<string, Set<string>>();
     const breakpointMap = new Map<string, boolean>();
+    const languageMap = new Map<string, ReturnType<typeof normalizeCodeLanguage>>();
 
     for (const block of codeBlocks) {
       outgoing.set(block.id, []);
       incoming.set(block.id, []);
       undirected.set(block.id, new Set<string>());
       breakpointMap.set(block.id, block.meta?.breakpoint === true);
+      languageMap.set(block.id, normalizeCodeLanguage(block.meta?.language));
     }
 
     for (const source of codeBlocks) {
@@ -844,12 +935,20 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
     };
 
     const linkedContentMap = new Map<string, string[]>();
+    const linkedStatsMap = new Map<string, { total: number; sameLanguage: number; mixedLanguage: number }>();
     for (const block of codeBlocks) {
       const component = collectComponent(block.id);
       const linkedIds = component.filter((id) => id !== block.id);
+      const currentLanguage = languageMap.get(block.id) ?? 'javascript';
+      const sameLanguageIds = linkedIds.filter((id) => (languageMap.get(id) ?? 'javascript') === currentLanguage);
+      linkedStatsMap.set(block.id, {
+        total: linkedIds.length,
+        sameLanguage: sameLanguageIds.length,
+        mixedLanguage: linkedIds.length - sameLanguageIds.length
+      });
       linkedContentMap.set(
         block.id,
-        linkedIds.map((id) => codeById.get(id)?.content || '').filter(Boolean)
+        sameLanguageIds.map((id) => codeById.get(id)?.content || '').filter(Boolean)
       );
     }
 
@@ -858,7 +957,9 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
       collectComponent,
       getTopologicalOrder,
       linkedContentMap,
-      breakpointMap
+      linkedStatsMap,
+      breakpointMap,
+      languageMap
     };
   }, [note.blocks]);
 
@@ -885,7 +986,10 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
 
     const component = codeGraph.collectComponent(blockId);
     const safeComponent = component.length > 0 ? component : [blockId];
-    const { order, hasCycle } = codeGraph.getTopologicalOrder(safeComponent);
+    const startLanguage = codeGraph.languageMap.get(blockId) ?? 'javascript';
+    const sameLanguageComponent = safeComponent.filter((id) => (codeGraph.languageMap.get(id) ?? 'javascript') === startLanguage);
+    const skippedLanguageCount = safeComponent.length - sameLanguageComponent.length;
+    const { order, hasCycle } = codeGraph.getTopologicalOrder(sameLanguageComponent);
     const runnableOrder = order.filter((id) => (codeGraph.codeById.get(id)?.content || '').trim().length > 0);
 
     if (runnableOrder.length === 0) return;
@@ -900,6 +1004,38 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
     setRunningCodeChain(runnableOrder);
     setBreakpointHitId(null);
 
+    const runStep = async (id: string) => {
+      currentBlockId = id;
+      setActiveRunningCodeId(id);
+      const hasBreakpoint = codeGraph.breakpointMap.get(id) === true;
+      setBreakpointHitId(hasBreakpoint ? id : null);
+      await wait(hasBreakpoint ? Math.max(stepMs * 3, 500) : stepMs);
+    };
+
+    if (!canExecuteInBrowser(startLanguage)) {
+      try {
+        for (const id of runnableOrder) {
+          await runStep(id);
+        }
+        const outputLines = [
+          getCodeBackendHint(startLanguage),
+          `[info] 当前链路语言: ${getCodeLanguageLabel(startLanguage)} (${startLanguage})`,
+          skippedLanguageCount > 0 ? `[info] 已跳过 ${skippedLanguageCount} 个跨语言连接块。` : '',
+          hasCycle ? '[warning] cycle detected; fallback order appended.' : '',
+          `[order] ${runnableOrder.join(' -> ')}`
+        ].filter(Boolean);
+        const nextBlocks = note.blocks.map((item) => (
+          item.id === blockId ? { ...item, output: outputLines.join('\n'), error: undefined } : item
+        ));
+        onChange(nextBlocks);
+      } finally {
+        setActiveRunningCodeId(null);
+        setRunningCodeChain([]);
+        setBreakpointHitId(null);
+      }
+      return;
+    }
+
     const originalLog = console.log;
     try {
       const logs: string[] = [];
@@ -912,17 +1048,14 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
       const fn = new AsyncFunction('__step', runnerBody) as (
         __step: (id: string) => Promise<void>
       ) => Promise<unknown>;
-      const result = await fn(async (id: string) => {
-        currentBlockId = id;
-        setActiveRunningCodeId(id);
-        const hasBreakpoint = codeGraph.breakpointMap.get(id) === true;
-        setBreakpointHitId(hasBreakpoint ? id : null);
-        await wait(hasBreakpoint ? Math.max(stepMs * 3, 500) : stepMs);
-      });
+      const result = await fn(runStep);
 
       let output = logs.join('\n');
       if (result !== undefined) {
         output += `${output ? '\n' : ''}${String(result)}`;
+      }
+      if (skippedLanguageCount > 0) {
+        output += `${output ? '\n' : ''}[info] skipped ${skippedLanguageCount} cross-language block(s).`;
       }
       if (hasCycle) {
         output += `${output ? '\n' : ''}[warning] cycle detected; fallback order appended.`;
@@ -952,21 +1085,23 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
 
     for (const source of note.blocks) {
       if (source.type === 'group' || !source.connections || source.connections.length === 0) continue;
+      const sourcePos = getRenderedPosition(source);
       const sourceSize = getBlockSize(source);
-      const sourceCenterX = source.position.x + sourceSize.width / 2;
-      const y1 = source.position.y + sourceSize.height / 2;
+      const sourceCenterX = sourcePos.x + sourceSize.width / 2;
+      const y1 = sourcePos.y + sourceSize.height / 2;
 
       for (const targetId of source.connections) {
         const target = blockMap.get(targetId);
         if (!target || target.type === 'group') continue;
 
+        const targetPos = getRenderedPosition(target);
         const targetSize = getBlockSize(target);
-        const targetCenterX = target.position.x + targetSize.width / 2;
-        const y2 = target.position.y + targetSize.height / 2;
+        const targetCenterX = targetPos.x + targetSize.width / 2;
+        const y2 = targetPos.y + targetSize.height / 2;
         const isTargetRight = targetCenterX >= sourceCenterX;
         const direction = isTargetRight ? 1 : -1;
-        const x1 = isTargetRight ? source.position.x + sourceSize.width : source.position.x;
-        const x2 = isTargetRight ? target.position.x : target.position.x + targetSize.width;
+        const x1 = isTargetRight ? sourcePos.x + sourceSize.width : sourcePos.x;
+        const x2 = isTargetRight ? targetPos.x : targetPos.x + targetSize.width;
         const curveStrength = Math.min(280, Math.max(90, Math.abs(x2 - x1) * 0.55));
         const c1x = x1 + direction * curveStrength;
         const c2x = x2 - direction * curveStrength;
@@ -984,7 +1119,7 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
     }
 
     return lines;
-  }, [connectingFromId, getBlockSize, note.blocks]);
+  }, [connectingFromId, getBlockSize, getRenderedPosition, note.blocks]);
 
   const blockIndexMap = useMemo(
     () => new Map(note.blocks.map((item, index) => [item.id, index])),
@@ -1108,6 +1243,17 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
             isAnyCodeExecuting={runningCodeChain.length > 0}
             showBlockFrames={layoutSettings.showBlockFrames}
             onFocusBlock={() => bringBlockToFront(block.id)}
+            previewOffset={getBlockPreviewOffset(block)}
+            onDragPreview={block.type === 'group' ? (position) => handleGroupDragPreview(block.id, position) : undefined}
+            onDragPreviewEnd={block.type === 'group' ? () => clearGroupDragPreview(block.id) : undefined}
+            codeLanguage={codeGraph.languageMap.get(block.id)}
+            onCodeLanguageChange={(language) => updateBlock(block.id, {
+              meta: {
+                ...(block.meta || {}),
+                language
+              }
+            })}
+            linkedCodeStats={codeGraph.linkedStatsMap.get(block.id)}
           />
         ))}
       </div>
