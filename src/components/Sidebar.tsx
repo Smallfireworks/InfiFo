@@ -11,6 +11,9 @@ interface SidebarProps {
   onClose: () => void;
   isOwner: boolean;
   onToggleOwner: () => void;
+  onFitCanvas: () => void;
+  onUndo: () => void;
+  onRedo: () => void;
   layoutSettings: LayoutSettings;
   onLayoutSettingsChange: (settings: LayoutSettings) => void;
 }
@@ -24,6 +27,9 @@ export function Sidebar({
   onClose,
   isOwner,
   onToggleOwner,
+  onFitCanvas,
+  onUndo,
+  onRedo,
   layoutSettings,
   onLayoutSettingsChange
 }: SidebarProps) {
@@ -96,6 +102,28 @@ export function Sidebar({
           <p className="text-xs text-[var(--color-ink-light)]">
             {isOwner ? 'Owner can edit, drag, run code, and connect blocks.' : 'Visitor is read-only and cannot modify blocks.'}
           </p>
+          <div className="grid grid-cols-3 gap-2">
+            <button
+              onClick={onUndo}
+              disabled={!isOwner}
+              className="px-2 py-1.5 text-xs rounded-md border border-[var(--color-ink)]/15 bg-[var(--color-paper)] hover:bg-[var(--color-ink)]/5 disabled:opacity-60"
+            >
+              Undo
+            </button>
+            <button
+              onClick={onRedo}
+              disabled={!isOwner}
+              className="px-2 py-1.5 text-xs rounded-md border border-[var(--color-ink)]/15 bg-[var(--color-paper)] hover:bg-[var(--color-ink)]/5 disabled:opacity-60"
+            >
+              Redo
+            </button>
+            <button
+              onClick={onFitCanvas}
+              className="px-2 py-1.5 text-xs rounded-md border border-[var(--color-ink)]/15 bg-[var(--color-paper)] hover:bg-[var(--color-ink)]/5"
+            >
+              Fit View
+            </button>
+          </div>
         </div>
 
         <div className="space-y-3 px-4 py-4 mt-3 bg-[var(--color-ink)]/5 rounded-xl">

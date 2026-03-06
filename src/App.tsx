@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { Notebook } from './components/Notebook';
 import { AIAssistant } from './components/AIAssistant';
@@ -30,6 +30,21 @@ const mockNotes: Note[] = [
 ];
 
 const LAYOUT_STORAGE_KEY = 'paper-notebook-layout-settings';
+const MAX_HISTORY_PER_NOTE = 80;
+
+interface NoteHistory {
+  past: BlockData[][];
+  future: BlockData[][];
+}
+
+function cloneBlocks(blocks: BlockData[]) {
+  return JSON.parse(JSON.stringify(blocks)) as BlockData[];
+}
+
+function blocksEqual(a: BlockData[], b: BlockData[]) {
+  if (a.length !== b.length) return false;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
 
 const defaultLayoutSettings: LayoutSettings = {
   organizeMode: 'stack',
@@ -49,6 +64,7 @@ export default function App() {
   const [aiContext, setAiContext] = useState<{ text: string, type: 'block' | 'selection' } | null>(null);
   const [panToPosition, setPanToPosition] = useState<{x: number, y: number} | null>(null);
   const [isOwner, setIsOwner] = useState(true);
+  const [fitRequestToken, setFitRequestToken] = useState(0);
   const [layoutSettings, setLayoutSettings] = useState<LayoutSettings>(() => {
     if (typeof window === 'undefined') return defaultLayoutSettings;
     try {
@@ -60,14 +76,71 @@ export default function App() {
       return defaultLayoutSettings;
     }
   });
+  const historyRef = useRef<Record<string, NoteHistory>>({});
 
   const activeNote = notes.find(n => n.id === activeNoteId) || notes[0];
 
+  const ensureNoteHistory = useCallback((noteId: string) => {
+    if (!historyRef.current[noteId]) {
+      historyRef.current[noteId] = { past: [], future: [] };
+    }
+    return historyRef.current[noteId];
+  }, []);
+
   const handleBlockChange = (updatedBlocks: BlockData[]) => {
-    setNotes((prev) => prev.map((n) => (
-      n.id === activeNoteId ? { ...n, blocks: updatedBlocks, updatedAt: Date.now() } : n
-    )));
+    setNotes((prev) => {
+      const target = prev.find((n) => n.id === activeNoteId);
+      if (!target) return prev;
+      if (blocksEqual(target.blocks, updatedBlocks)) return prev;
+
+      const history = ensureNoteHistory(activeNoteId);
+      history.past.push(cloneBlocks(target.blocks));
+      if (history.past.length > MAX_HISTORY_PER_NOTE) {
+        history.past.splice(0, history.past.length - MAX_HISTORY_PER_NOTE);
+      }
+      history.future = [];
+
+      return prev.map((n) => (
+        n.id === activeNoteId ? { ...n, blocks: cloneBlocks(updatedBlocks), updatedAt: Date.now() } : n
+      ));
+    });
   };
+
+  const handleUndo = useCallback(() => {
+    if (!isOwner) return;
+    setNotes((prev) => {
+      const target = prev.find((n) => n.id === activeNoteId);
+      if (!target) return prev;
+      const history = ensureNoteHistory(activeNoteId);
+      const previous = history.past.pop();
+      if (!previous) return prev;
+      history.future.push(cloneBlocks(target.blocks));
+      if (history.future.length > MAX_HISTORY_PER_NOTE) {
+        history.future.splice(0, history.future.length - MAX_HISTORY_PER_NOTE);
+      }
+      return prev.map((n) => (
+        n.id === activeNoteId ? { ...n, blocks: cloneBlocks(previous), updatedAt: Date.now() } : n
+      ));
+    });
+  }, [activeNoteId, ensureNoteHistory, isOwner]);
+
+  const handleRedo = useCallback(() => {
+    if (!isOwner) return;
+    setNotes((prev) => {
+      const target = prev.find((n) => n.id === activeNoteId);
+      if (!target) return prev;
+      const history = ensureNoteHistory(activeNoteId);
+      const next = history.future.pop();
+      if (!next) return prev;
+      history.past.push(cloneBlocks(target.blocks));
+      if (history.past.length > MAX_HISTORY_PER_NOTE) {
+        history.past.splice(0, history.past.length - MAX_HISTORY_PER_NOTE);
+      }
+      return prev.map((n) => (
+        n.id === activeNoteId ? { ...n, blocks: cloneBlocks(next), updatedAt: Date.now() } : n
+      ));
+    });
+  }, [activeNoteId, ensureNoteHistory, isOwner]);
 
   const handleAIRequest = (text: string, type: 'block' | 'selection') => {
     setAiContext({ text, type });
@@ -81,9 +154,47 @@ export default function App() {
     }
   };
 
+  const handleFitCanvas = useCallback(() => {
+    setFitRequestToken((prev) => prev + 1);
+  }, []);
+
   useEffect(() => {
     localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(layoutSettings));
   }, [layoutSettings]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!isOwner) return;
+      const target = event.target as HTMLElement | null;
+      const isInputLike = Boolean(
+        target &&
+        (
+          target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.isContentEditable
+        )
+      );
+      if (isInputLike) return;
+
+      const commandKey = event.ctrlKey || event.metaKey;
+      if (!commandKey) return;
+      const key = event.key.toLowerCase();
+
+      if (key === 'z' && !event.shiftKey) {
+        event.preventDefault();
+        handleUndo();
+        return;
+      }
+
+      if ((key === 'z' && event.shiftKey) || key === 'y') {
+        event.preventDefault();
+        handleRedo();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleRedo, handleUndo, isOwner]);
 
   return (
     <div className="flex h-screen overflow-hidden bg-[var(--color-paper)]">
@@ -104,6 +215,9 @@ export default function App() {
           onClose={() => setSidebarOpen(false)} 
           isOwner={isOwner}
           onToggleOwner={() => setIsOwner(!isOwner)}
+          onFitCanvas={handleFitCanvas}
+          onUndo={handleUndo}
+          onRedo={handleRedo}
           layoutSettings={layoutSettings}
           onLayoutSettingsChange={setLayoutSettings}
         />
@@ -117,6 +231,7 @@ export default function App() {
           panToPosition={panToPosition}
           isOwner={isOwner}
           layoutSettings={layoutSettings}
+          fitRequestToken={fitRequestToken}
         />
       </main>
 

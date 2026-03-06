@@ -45,6 +45,7 @@ interface BlockProps {
   hasBreakpoint?: boolean;
   isBreakpointHit?: boolean;
   isAnyCodeExecuting?: boolean;
+  onFocusBlock?: () => void;
 }
 
 type DrawTool = 'pen' | 'eraser';
@@ -258,7 +259,8 @@ export function Block({
   onToggleBreakpoint,
   hasBreakpoint = false,
   isBreakpointHit = false,
-  isAnyCodeExecuting = false
+  isAnyCodeExecuting = false,
+  onFocusBlock
 }: BlockProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [selectionRect, setSelectionRect] = useState<DOMRect | null>(null);
@@ -846,6 +848,7 @@ export function Block({
   };
 
   const handleBlockPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    onFocusBlock?.();
     if (event.button !== 0) return;
     const direction = detectResizeDirection(event);
     if (!direction) return;
@@ -960,6 +963,7 @@ export function Block({
           onPointerDown={(e) => {
             e.preventDefault();
             e.stopPropagation();
+            onFocusBlock?.();
             dragControls.start(e);
           }}
           className="absolute -top-4 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 cursor-grab active:cursor-grabbing p-1.5 bg-[var(--color-paper)] rounded-full border border-[var(--color-ink)]/10 shadow-sm z-30 transition-opacity"

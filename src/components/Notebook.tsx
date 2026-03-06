@@ -10,6 +10,7 @@ interface NotebookProps {
   panToPosition: {x: number, y: number} | null;
   isOwner: boolean;
   layoutSettings: LayoutSettings;
+  fitRequestToken: number;
 }
 
 interface ContextMenuState {
@@ -102,7 +103,7 @@ const BLOCK_LIBRARY: BlockTemplate[] = [
 const CANVAS_SIZE = 5000;
 const CANVAS_HALF = CANVAS_SIZE / 2;
 const MIN_CANVAS_SCALE = 0.45;
-const MAX_CANVAS_SCALE = 2.2;
+const MAX_CANVAS_SCALE = 1.9;
 
 function getFallbackSize(block: BlockData): BlockSize {
   if (block.size) return block.size;
@@ -124,7 +125,30 @@ function getFallbackSize(block: BlockData): BlockSize {
   }
 }
 
-export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, layoutSettings }: NotebookProps) {
+function getBlockLayer(block: BlockData, fallback: number) {
+  const value = block.meta?.zIndex;
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function isDescendantOf(block: BlockData, ancestorId: string, blockMap: Map<string, BlockData>) {
+  let cursor = block.parentId;
+  while (cursor) {
+    if (cursor === ancestorId) return true;
+    cursor = blockMap.get(cursor)?.parentId;
+  }
+  return false;
+}
+
+function isAncestorOf(candidateId: string, targetId: string, blockMap: Map<string, BlockData>) {
+  let cursor = blockMap.get(targetId)?.parentId;
+  while (cursor) {
+    if (cursor === candidateId) return true;
+    cursor = blockMap.get(cursor)?.parentId;
+  }
+  return false;
+}
+
+export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, layoutSettings, fitRequestToken }: NotebookProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const zoomShellRef = useRef<HTMLDivElement>(null);
   const canvasBgRef = useRef<HTMLDivElement>(null);
@@ -146,7 +170,13 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
       zoomShellRef.current.style.height = `${CANVAS_SIZE * scale}px`;
     }
     if (canvasBgRef.current) {
-      canvasBgRef.current.style.transform = `scale(${scale})`;
+      const style = canvasBgRef.current.style as CSSStyleDeclaration & { zoom?: string };
+      if (typeof style.zoom !== 'undefined') {
+        style.zoom = String(scale);
+        canvasBgRef.current.style.transform = 'scale(1)';
+      } else {
+        canvasBgRef.current.style.transform = `scale(${scale})`;
+      }
     }
   }, []);
 
@@ -171,6 +201,51 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
       });
     }
   }, [panToPosition]);
+
+  useEffect(() => {
+    if (!containerRef.current || fitRequestToken <= 0) return;
+    if (note.blocks.length === 0) {
+      canvasScaleRef.current = 1;
+      applyCanvasScale(1);
+      containerRef.current.scrollLeft = CANVAS_HALF - containerRef.current.clientWidth / 2;
+      containerRef.current.scrollTop = CANVAS_HALF - containerRef.current.clientHeight / 2;
+      return;
+    }
+
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+
+    for (const block of note.blocks) {
+      const size = getFallbackSize(block);
+      minX = Math.min(minX, block.position.x);
+      minY = Math.min(minY, block.position.y);
+      maxX = Math.max(maxX, block.position.x + size.width);
+      maxY = Math.max(maxY, block.position.y + size.height);
+    }
+
+    const contentWidth = Math.max(1, maxX - minX);
+    const contentHeight = Math.max(1, maxY - minY);
+    const padding = 120;
+    const targetScale = Math.min(
+      MAX_CANVAS_SCALE,
+      Math.max(
+        MIN_CANVAS_SCALE,
+        Math.min(
+          containerRef.current.clientWidth / (contentWidth + padding * 2),
+          containerRef.current.clientHeight / (contentHeight + padding * 2)
+        )
+      )
+    );
+
+    canvasScaleRef.current = targetScale;
+    applyCanvasScale(targetScale);
+    const centerX = minX + contentWidth / 2;
+    const centerY = minY + contentHeight / 2;
+    containerRef.current.scrollLeft = centerX * targetScale - containerRef.current.clientWidth / 2;
+    containerRef.current.scrollTop = centerY * targetScale - containerRef.current.clientHeight / 2;
+  }, [applyCanvasScale, fitRequestToken, note.blocks]);
 
   useEffect(() => {
     if (!isOwner) {
@@ -199,6 +274,13 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
 
   const setGuideState = useCallback((next: GuideState) => {
     setDragGuides((prev) => (prev.x === next.x && prev.y === next.y ? prev : next));
+  }, []);
+
+  const getNextLayer = useCallback((blocks: BlockData[]) => {
+    const maxLayer = blocks.reduce((max, item, index) => (
+      Math.max(max, getBlockLayer(item, index))
+    ), 0);
+    return maxLayer + 1;
   }, []);
 
   const isCanvasBackgroundTarget = (target: HTMLElement | null) => {
@@ -302,15 +384,39 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
     if (!contextMenu || !isOwner) return;
     const template = BLOCK_LIBRARY.find((item) => item.type === type);
     if (!template) return;
+    const nextLayer = getNextLayer(note.blocks);
     const newBlock: BlockData = {
       id: `block-${Date.now()}`,
       type,
       content: template.defaultContent,
       position: { x: contextMenu.x, y: contextMenu.y },
-      size: template.defaultSize
+      size: template.defaultSize,
+      meta: { zIndex: nextLayer }
     };
     onChange([...note.blocks, newBlock]);
     closeContextMenu();
+  };
+
+  const bringBlockToFront = (blockId: string) => {
+    if (!isOwner) return;
+    const target = note.blocks.find((item) => item.id === blockId);
+    if (!target || target.type === 'group') return;
+    const nextLayer = getNextLayer(note.blocks);
+    const currentLayer = getBlockLayer(target, 0);
+    if (currentLayer >= nextLayer - 1) return;
+
+    const nextBlocks = note.blocks.map((item) => (
+      item.id === blockId
+        ? {
+            ...item,
+            meta: {
+              ...(item.meta || {}),
+              zIndex: nextLayer
+            }
+          }
+        : item
+    ));
+    onChange(nextBlocks);
   };
 
   const updateBlock = (id: string, updates: Partial<BlockData>) => {
@@ -324,8 +430,9 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
     if (block.type === 'group' && updates.position) {
       const dx = updates.position.x - block.position.x;
       const dy = updates.position.y - block.position.y;
+      const blockMap = new Map(newBlocks.map((item) => [item.id, item]));
       newBlocks = newBlocks.map((item) => {
-        if (item.parentId === id && item.locked) {
+        if (item.id !== id && isDescendantOf(item, id, blockMap) && item.locked) {
           return { ...item, position: { x: item.position.x + dx, y: item.position.y + dy } };
         }
         return item;
@@ -338,11 +445,15 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
 
   const deleteBlock = (id: string) => {
     if (!isOwner) return;
+    const blockMap = new Map(note.blocks.map((item) => [item.id, item]));
+    const descendantIds = new Set(
+      note.blocks.filter((item) => isDescendantOf(item, id, blockMap)).map((item) => item.id)
+    );
     const nextBlocks = note.blocks
       .filter((item) => item.id !== id)
       .map((item) => {
         const nextConnections = item.connections?.filter((targetId) => targetId !== id);
-        if (item.parentId === id) {
+        if (descendantIds.has(item.id)) {
           return { ...item, parentId: undefined, locked: false, connections: nextConnections };
         }
         if (!nextConnections || nextConnections.length === item.connections?.length) {
@@ -466,10 +577,12 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
     const gap = Math.max(8, layoutSettings.gap);
     const paddingX = 24;
     const paddingTop = 80;
+    const blockMap = new Map(note.blocks.map((item) => [item.id, item]));
 
     const children = note.blocks
       .filter((item) => {
-        if (item.id === groupId || item.type === 'group') return false;
+        if (item.id === groupId) return false;
+        if (isAncestorOf(item.id, groupId, blockMap)) return false;
         const { width, height } = getBlockSize(item);
         const centerX = item.position.x + width / 2;
         const centerY = item.position.y + height / 2;
@@ -873,10 +986,20 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
     return lines;
   }, [connectingFromId, getBlockSize, note.blocks]);
 
+  const blockIndexMap = useMemo(
+    () => new Map(note.blocks.map((item, index) => [item.id, index])),
+    [note.blocks]
+  );
+
   const sortedBlocks = [...note.blocks].sort((a, b) => {
     if (a.type === 'group' && b.type !== 'group') return -1;
     if (a.type !== 'group' && b.type === 'group') return 1;
-    return 0;
+    const indexA = blockIndexMap.get(a.id) ?? 0;
+    const indexB = blockIndexMap.get(b.id) ?? 0;
+    const layerA = getBlockLayer(a, indexA);
+    const layerB = getBlockLayer(b, indexB);
+    if (layerA !== layerB) return layerA - layerB;
+    return indexA - indexB;
   });
 
   return (
@@ -984,6 +1107,7 @@ export function Notebook({ note, onChange, onRequestAI, panToPosition, isOwner, 
             isBreakpointHit={breakpointHitId === block.id}
             isAnyCodeExecuting={runningCodeChain.length > 0}
             showBlockFrames={layoutSettings.showBlockFrames}
+            onFocusBlock={() => bringBlockToFront(block.id)}
           />
         ))}
       </div>
